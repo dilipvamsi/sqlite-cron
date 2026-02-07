@@ -1,7 +1,8 @@
 # Simple Makefile for sqlite-cron
 CC = gcc
 CC_WIN = x86_64-w64-mingw32-gcc
-CFLAGS = -g -fPIC -O3 -DTEST_MODE -Iheaders
+CFLAGS = -g -fPIC -O3 -DTEST_MODE -DCRON_USE_LOCAL_TIME -Iheaders -Iexternal
+
 
 LDFLAGS_LINUX = -shared -lpthread
 LDFLAGS_MAC = -dynamiclib
@@ -17,18 +18,23 @@ all:
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
 
-linux: $(BUILD_DIR)
-	$(CC) $(CFLAGS) $(COVERAGE) src/sqlite_cron.c -o $(BUILD_DIR)/sqlite_cron.so $(LDFLAGS_LINUX)
+linux: $(BUILD_DIR) download-ccronexpr
+	$(CC) $(CFLAGS) $(COVERAGE) src/sqlite_cron.c external/ccronexpr.c -o $(BUILD_DIR)/sqlite_cron.so $(LDFLAGS_LINUX)
 
-macos: $(BUILD_DIR)
-	$(CC) $(CFLAGS) src/sqlite_cron.c -o $(BUILD_DIR)/sqlite_cron.dylib $(LDFLAGS_MAC)
 
-windows: $(BUILD_DIR)
-	$(CC) $(CFLAGS) src/sqlite_cron.c -o $(BUILD_DIR)/sqlite_cron.dll $(LDFLAGS_WIN)
+macos: $(BUILD_DIR) download-ccronexpr
+	$(CC) $(CFLAGS) src/sqlite_cron.c external/ccronexpr.c -o $(BUILD_DIR)/sqlite_cron.dylib $(LDFLAGS_MAC)
+
+
+windows: $(BUILD_DIR) download-ccronexpr
+	$(CC) $(CFLAGS) src/sqlite_cron.c external/ccronexpr.c -o $(BUILD_DIR)/sqlite_cron.dll $(LDFLAGS_WIN)
+
 
 # Cross-compile Windows DLL on Linux
-windows-cross: $(BUILD_DIR) download-headers
-	$(CC_WIN) $(CFLAGS) -DTEST_MODE src/sqlite_cron.c -o $(BUILD_DIR)/sqlite_cron.dll $(LDFLAGS_WIN)
+windows-cross: $(BUILD_DIR) download-headers download-ccronexpr
+	$(CC_WIN) $(CFLAGS) -DTEST_MODE src/sqlite_cron.c external/ccronexpr.c -o $(BUILD_DIR)/sqlite_cron.dll $(LDFLAGS_WIN)
+
+
 
 download-headers:
 	@if [ -f headers/sqlite3.h ] && [ -f headers/sqlite3ext.h ]; then \
@@ -43,16 +49,22 @@ download-headers:
 		echo "SQLite headers downloaded."; \
 	fi
 
+download-ccronexpr:
+	@if [ -f external/ccronexpr.h ] && [ -f external/ccronexpr.c ]; then \
+		echo "ccronexpr already exists, skipping download."; \
+	else \
+		echo "Downloading ccronexpr from supertinycron..."; \
+		mkdir -p external; \
+		curl -L https://raw.githubusercontent.com/exander77/supertinycron/master/ccronexpr.h -o external/ccronexpr.h; \
+		curl -L https://raw.githubusercontent.com/exander77/supertinycron/master/ccronexpr.c -o external/ccronexpr.c; \
+		echo "ccronexpr downloaded."; \
+	fi
+
 test: linux
 	python -m unittest tests.test_cron -v
 
-# Use pytest if preferred (requires pip install pytest)
-test-pytest: linux
-	pytest tests/test_cron.py
-
 test-windows: windows-cross
 	python -m unittest tests.test_cron -v
-
 
 leak-check: linux download-headers
 	$(CC) $(CFLAGS) tests/leak_check.c -o $(BUILD_DIR)/leak_check -lsqlite3
@@ -66,9 +78,12 @@ leak-check-windows: windows-cross
 	wine ./$(BUILD_DIR)/leak_check.exe
 	rm -f $(BUILD_DIR)/leak_check.exe
 
-coverage: clean $(BUILD_DIR) download-headers
+coverage: clean $(BUILD_DIR) download-headers download-ccronexpr
+
 	$(CC) $(CFLAGS) -DTEST_MODE -fprofile-arcs -ftest-coverage -c src/sqlite_cron.c -o $(BUILD_DIR)/sqlite_cron.o
-	$(CC) $(BUILD_DIR)/sqlite_cron.o -o $(BUILD_DIR)/sqlite_cron.so $(LDFLAGS_LINUX) -lgcov
+	$(CC) $(CFLAGS) -DTEST_MODE -c external/ccronexpr.c -o $(BUILD_DIR)/ccronexpr.o
+	$(CC) $(BUILD_DIR)/sqlite_cron.o $(BUILD_DIR)/ccronexpr.o -o $(BUILD_DIR)/sqlite_cron.so $(LDFLAGS_LINUX) -lgcov
+
 	python -m unittest tests.test_cron -v
 	gcov -o $(BUILD_DIR) src/sqlite_cron.c
 	mv sqlite_cron.c.gcov $(BUILD_DIR)/
