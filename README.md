@@ -1,16 +1,147 @@
 # sqlite-cron
 
-![Coverage](https://img.shields.io/badge/coverage-94.84%25-brightgreen)
+![Coverage](https://img.shields.io/badge/coverage-91%25-brightgreen)
 ![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue)
-![Tests](https://img.shields.io/badge/tests-32%20passed-success)
+![Tests](https://img.shields.io/badge/tests-56%20passed-success)
 ![Language](https://img.shields.io/badge/language-C-orange)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
-A SQLite extension for scheduling background SQL jobs, inspired by `pg_cron`.
+A powerful SQLite extension for scheduling jobs directly within your database. Think of it as `pg_cron` for SQLite.
 
+## Features
+
+- 🕒 **Standard Cron Syntax**: Schedule jobs using familiar syntax (e.g., `*/5 * * * *`).
+- 🔄 **Interval Scheduling**: Run jobs every N seconds.
+- 💾 **Persisted Jobs**: Schedules are stored in tables and survive restarts.
+- ⚡ **Zero-Config**: Works out of the box with reasonable defaults.
+- 🧵 **Flexible Modes**:
+    - **Thread Mode**: Spawns a dedicated background thread (recommended).
+    - **Callback Mode**: Piggybacks on your existing queries (perfect for WASM/embedded).
+- 🛡️ **Reliable**: Built-in crash recovery, timeouts, and retry logic.
+- 📊 **Introspection**: Query job status, history, and next run times as JSON.
+
+## Installation
+
+### 1. Download
+Grab the latest release from the [Releases](https://github.com/dilipvamsi/sqlite-cron/releases) page.
+- `sqlite_cron-linux-x64.so`
+- `sqlite_cron-windows-x64.dll`
+- `sqlite_cron-macos-universal.dylib`
+
+### 2. Load Extension
+```sql
+.load path/to/sqlite_cron
+```
+*Or in Python:*
+```python
+import sqlite3
+conn = sqlite3.connect("my.db")
+conn.enable_load_extension(True)
+conn.load_extension("./sqlite_cron")
+```
+
+## Quick Start
+
+### Initialize
+Start the cron engine. **Thread mode** is best for most apps.
+```sql
+-- Check for jobs every 4 seconds
+SELECT cron_init('thread', 4);
+```
+
+### Schedule a Job
+Schedule a SQL command to run periodically.
+```sql
+-- Run VACUUM every day at 3:30 AM
+SELECT cron_schedule_cron('daily_maintenance', '30 3 * * *', 'VACUUM;');
+
+-- Run a cleanup every 10 seconds with a 5s execution timeout
+SELECT cron_schedule('cleanup', 10, 'DELETE FROM events WHERE created_at < date("now", "-7 days");', 5000);
+```
+
+### Manage & Monitor
+```sql
+-- Manually trigger a job right now
+SELECT cron_run('cleanup');
+
+-- Check engine health and active job count
+SELECT cron_status();
+
+-- Find when the next job is due
+SELECT cron_next_job();
+```
+
+## Execution Modes
+
+`sqlite-cron` supports two distinct modes of operation. Choose the one that fits your environment.
+
+| Feature | `thread` (Recommended) | `callback` |
+| :--- | :--- | :--- |
+| **Mechanism** | Spawns a dedicated OS thread. | Hooks into `sqlite3_progress_handler`. |
+| **Concurrency** | **High**. Runs jobs in parallel to your app. | **Low**. Pauses your main query to run jobs. |
+| **Reliability** | **High**. Independent of main app activity. | **Variable**. Only runs *while* you are executing queries. |
+| **Best For** | Servers, Daemons, CLI tools. | WASM, Mobile, strict single-threaded envs. |
+| **Prerequisites** | Requires thread support (pthreads/Windows). | None. Pure SQLite API. |
+
+### 1. Thread Mode
+The default and most robust mode. It creates a background thread that wakes up periodically to check for jobs.
+```sql
+-- Check every 5 seconds
+SELECT cron_init('thread', 5);
+```
+
+### 2. Callback Mode
+For environments where spawning threads is forbidden or impossible (e.g., some sandboxed environments, WASM). It relies on the "heartbeat" of your own SQL queries.
+```sql
+-- Check every 1 second, but only after every 10 SQL opcodes
+SELECT cron_init('callback', 1, 10);
+```
+
+## Example Use Cases
+
+### 1. Database Maintenance
+Keep your database healthy by scheduling regular VACUUM and ANALYZE commands.
+```sql
+-- Vacuum every night at 4 AM
+SELECT cron_schedule_cron('vacuum', '0 4 * * *', 'VACUUM;');
+-- Analyze statistics every Sunday
+SELECT cron_schedule_cron('analyze', '0 0 * * 0', 'ANALYZE;');
+```
+
+### 2. Data Retention Policy
+Automatically delete old data to manage database size.
+```sql
+-- Delete events older than 30 days, check every hour
+SELECT cron_schedule('prune_events', 3600, 'DELETE FROM events WHERE created_at < date("now", "-30 days");');
+```
+
+### 3. Periodic Reporting
+Generate summary tables for dashboards.
+```sql
+-- Update daily stats table every 5 minutes
+SELECT cron_schedule('refresh_stats', 300,
+  'INSERT INTO daily_stats (category, count)
+   SELECT category, count(*) FROM visits WHERE date(timestamp) = date("now")
+   GROUP BY category
+   ON CONFLICT(category) DO UPDATE SET count=excluded.count;');
+```
+
+## FAQ & Troubleshooting
+
+### **Q: Does this work with WAL mode?**
+**A:** Yes! In fact, WAL mode is recommended for concurrent access. The background thread opens its own connection, so WAL helps avoid locking issues.
+
+### **Q: What happens if I restart my application?**
+**A:** Jobs are persisted in the `__cron_jobs` table. When you restart and call `cron_init()`, the engine re-reads the schedule and continues where it left off.
+
+### **Q: My jobs aren't running!**
+- Did you call `cron_init()`?
+- Is the polling interval too long?
+- Check `__cron_log` for errors: `SELECT * FROM __cron_log ORDER BY id DESC LIMIT 5;`
 
 ## Architecture
 
+### System Overview
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                           SQLite Connection                             │
@@ -37,13 +168,13 @@ A SQLite extension for scheduling background SQL jobs, inspired by `pg_cron`.
 │             ▼                     │  │  Execute due jobs   │            │
 │  ┌─────────────────────┐          │  └─────────────────────┘            │
 │  │  __cron_jobs table  │◄─────────┼──────────────────────────────────►  │
-│  │  (interval / cron)  │          │                                     │
+│  │  __cron_log  table  │          │                                     │
 │  └─────────────────────┘          │                                     │
 └─────────────────────────────────────────────────────────────────────────┘
+```
 
-                        Graceful Shutdown Flow
-                        ──────────────────────
-
+### Graceful Shutdown Flow
+```
    cron_stop() or connection close
               │
               ▼
@@ -71,170 +202,188 @@ A SQLite extension for scheduling background SQL jobs, inspired by `pg_cron`.
    └──────────────────────┘
 ```
 
-### Scheduling Cycle (`cron_tick`)
-1. **Check**: The thread wakes up (every second) and queries `__cron_jobs` for active jobs where `next_run <= now`.
-2. **Execute**: It spawns a separate transaction to run the job's SQL command.
-3. **Reschedule**: After execution, it calculates the **new** `next_run`:
-   - **Cron Expression**: If `cron_expr` is set (e.g., `*/5 * * * * *`), it uses `ccronexpr` to calculate the next match based on the *current wall-clock time*.
-   - **Interval**: If `cron_expr` is NULL, it simply adds `schedule_interval` seconds to the current time.
+## API Reference
 
-## Installation
+### 1. Initialization
+`cron_init` handles setup based on the chosen mode.
 
-1. Compile the extension: `make linux` (or `macos`, `windows`).
-2. Load it into your SQLite session: `.load build/sqlite_cron`
+#### Thread Mode (Recommended)
+| Signature | Description |
+| :--- | :--- |
+| `cron_init('thread')` | 1s poll interval, system local timezone. |
+| `cron_init('thread', poll_sec)` | Custom poll interval (seconds). |
+| `cron_init('thread', timezone)` | Custom Timezone (e.g., '+05:30', 'Z'). |
+| `cron_init('thread', poll_sec, timezone)` | Full configuration. |
 
-## Running Tests
+#### Callback Mode
+| Signature | Description |
+| :--- | :--- |
+| `cron_init('callback')` | Default (1s rate limit, 100 opcodes). |
+| `cron_init('callback', rate_limit)` | Custom rate limit (seconds). |
+| `cron_init('callback', timezone)` | Custom Timezone. |
+| `cron_init('callback', rate_limit, opcodes)` | Custom limit & opcode threshold. |
 
-### Linux / macOS
+---
+
+### 2. Job Management
+
+#### `cron_schedule(name, interval_sec, sql, [timeout_ms])`
+Schedules a task to run every N seconds.
+```sql
+-- Run cleanup every hour with a 5s timeout
+SELECT cron_schedule('cleanup', 3600, 'DELETE FROM logs;', 5000);
+```
+
+#### `cron_schedule_cron(name, cron_expr, sql, [timeout_ms])`
+Schedules a task using standard cron syntax (`min hour day month dow`).
+```sql
+-- Run at 3:30 AM every day
+SELECT cron_schedule_cron('backup', '30 3 * * *', 'VACUUM;');
+```
+
+#### `cron_pause(name)` / `cron_resume(name)`
+Temporarily disable or re-enable a job without deleting it.
+```sql
+SELECT cron_pause('backup');
+SELECT cron_resume('backup');
+```
+
+#### `cron_update(name, interval_sec)`
+Updates the interval for an existing non-cron job.
+```sql
+SELECT cron_update('cleanup', 7200); -- Change to every 2 hours
+```
+
+#### `cron_run(name)`
+Manually triggers a job immediately, regardless of its schedule. Useful for manual overrides or testing.
+```sql
+SELECT cron_run('backup');
+```
+
+#### `cron_delete(name)`
+Permanently removes a job from the schedule.
+```sql
+SELECT cron_delete('cleanup');
+```
+
+#### `cron_set_retry(name, max_retries, retry_interval_sec)`
+Configures automatic retries for a specific job if it fails.
+```sql
+-- Retry 3 times, waiting 10s between attempts
+SELECT cron_set_retry('api_sync', 3, 10);
+```
+
+---
+
+### 3. Introspection & Maintenance
+
+| Function | Description | Returns |
+| :--- | :--- | :--- |
+| `cron_get(name)` | Detailed settings for a specific job. | JSON Object |
+| `cron_list()` | List all jobs with their current state. | JSON Array |
+| `cron_status()` | Engine health, mode, and job counts. | JSON Object |
+| `cron_job_next(name)` | Next planned timestamp (epoch) for a specific job. | Integer |
+| `cron_next_job()` | Details of the single nearest upcoming job. | JSON Object |
+| `cron_next_job_time()` | Map of all job names to their next run timestamps. | JSON Object |
+| `cron_purge_logs(retention)` | Delete logs older than period (e.g., '-7 days'). | Integer (count) |
+| `cron_reset()` | Stop engine and wipe all non-persistent state (for testing). | String |
+
+---
+
+### 4. Configuration
+Settings are persisted in the `__cron_config` table.
+
+| Function | Description | Example |
+| :--- | :--- | :--- |
+| `cron_set_config(k, v)` | Set a persistent configuration value. | `SELECT cron_set_config('timezone', '+05:30');` |
+| `cron_get_config(k)` | Retrieve a configuration value. | `SELECT cron_get_config('timezone');` |
+
+## Building from Source
+
+### Prerequisites
+- **Linux**: `gcc`, `make`, `libsqlite3-dev`
+- **Windows**: `mingw-w64`
+- **macOS**: `Xcode Command Line Tools`
+
+### Build
+```bash
+make linux    # or make windows, make macos
+```
+
+### Test
 ```bash
 make test
 ```
 
-### Windows
-1. Install **MinGW-w64** (for `gcc`) and **Python**.
-2. Run the build: `make windows`
-3. Run the tests: `pytest tests/test_cron.py`
+### Leak Check (Linux)
+Requires `valgrind`.
+```bash
+make leak-check
+```
 
+### Clean
+```bash
+make clean
+```
 
-### `SELECT cron_init(mode, [p1], [p2]);`
-Initializes the cron engine.
-- `mode`:
-  - `thread`: (Recommended) Spawns a background OS thread.
-  - `callback`: Piggybacks on your existing queries.
-- **Thread Parameters** (`p1`):
-  - `poll_seconds`: How often the thread checks for jobs (default 16s).
-- **Callback Parameters** (`p1`, `p2`):
-  - `rate_limit_seconds`: Minimum seconds between checks (default 1s).
-  - `opcode_threshold`: Number of SQL opcodes between progress callbacks (default 100 in production, 1 in test).
+### Windows (via Wine on Linux/macOS)
+If you don't have a Windows machine, you can run tests using Wine.
+1. Install `wine` and `mingw-w64`.
+2. Run smoke tests:
+   ```bash
+   make test-wine-quick
+   ```
+3. Run full Python test suite (automatically installs Python in Wine):
+   ```bash
+   make test-wine-full
+   ```
+
+### Timezone Support
+By default, the cron engine uses UTC. You can configure a global timezone offset to run jobs according to your local time.
 
 ```sql
-SELECT cron_init('thread', 4);    -- Thread mode, 4s poll
-SELECT cron_init('callback', 1, 10); -- Callback mode, 1s limit, check every 10 opcodes
+-- Set timezone to India Standard Time (+05:30)
+SELECT cron_set_config('timezone', '+05:30');
+
+-- Set timezone to EST (-05:00)
+SELECT cron_set_config('timezone', '-05:00');
+
+-- Reset to UTC
+SELECT cron_set_config('timezone', 'Z');
 ```
 
-### `SELECT cron_schedule(name, seconds, sql_command, [timeout_ms]);`
-Schedules a task with a unique name.
-- `timeout_ms` (optional): Maximum execution time in milliseconds. If exceeded, the job is interrupted.
+**Persistence**: The timezone setting is stored in a `__cron_config` table and persists across database restarts.
 
+Alternatively, you can set the timezone during initialization:
 ```sql
-SELECT cron_schedule('vacuum_job', 3600, 'VACUUM;');
--- Schedule with a 5-second timeout
-SELECT cron_schedule('long_job', 60, 'DELETE FROM large_table;', 5000);
+-- Thread mode: cron_init(mode, poll_interval, timezone)
+SELECT cron_init('thread', 1, '+05:30');
+
+-- Thread mode: cron_init(mode, timezone) - Uses default poll interval (1s)
+SELECT cron_init('thread', '+05:30');
+
+-- Callback mode: cron_init(mode, rate_limit, opcode_threshold, timezone)
+SELECT cron_init('callback', 1, 100, '+05:30');
+
+-- Callback mode: cron_init(mode, timezone) - Uses default rate/opcodes
+SELECT cron_init('callback', '+05:30');
 ```
 
-### `SELECT cron_schedule_cron(name, cron_expr, sql_command, [timeout_ms]);`
-Schedules a task using a cron expression.
-- `timeout_ms` (optional): Maximum execution time in milliseconds.
+### Compile-Time Options
+You can customize the extension via `CFLAGS`:
 
-```sql
-SELECT cron_schedule_cron('daily_vacuum', '0 30 23 * * *', 'VACUUM;');
--- Schedule with timeout
-SELECT cron_schedule_cron('heavy_report', '0 0 1 * * *', 'INSERT INTO report...', 10000);
+| Flag | Description | Default |
+| :--- | :--- | :--- |
+| `-DCRON_USE_LOCAL_TIME` | Forces `ccronexpr` to use `localtime()`. Not recommended since native timezone support covers this. | Disabled |
+| `-DTEST_MODE` | Aggressive polling (1s thread) and low callback threshold for testing. | Disabled |
+| `-DDEBUG` | Enable verbose debug logging to stderr. | Disabled |
+| `-DCRON_SQL_LOG` | Log executed SQL commands to stdout for auditing. | Disabled |
+
+```bash
+# Example: Build with debug symbols and logging
+make linux CFLAGS="-g -O3 -DDEBUG -DCRON_SQL_LOG -Iheaders -Iexternal"
 ```
-
-### `SELECT cron_get(name);`
-Returns a JSON object describing the job.
-```sql
-SELECT cron_get('vacuum_job');
--- {"name":"vacuum_job","command":"VACUUM;","interval":3600,"active":1,"next_run":...}
-```
-
-### `SELECT cron_list();`
-Returns a JSON array of all scheduled jobs.
-
-### `SELECT cron_pause(name);`
-Temporarily stops a job from executing.
-
-### `SELECT cron_resume(name);`
-Resumes a paused job.
-
-### `SELECT cron_update(name, seconds);`
-Updates the execution interval for a job.
-
-### `SELECT cron_set_retry(name, max_retries, retry_interval_seconds);`
-Configures retry logic for a specific job.
-- `max_retries`: Number of times to retry a failed job.
-- `retry_interval_seconds`: Seconds to wait before retrying.
-
-```sql
-SELECT cron_schedule('unstable_job', 3600, 'INSERT INTO ...');
-SELECT cron_set_retry('unstable_job', 3, 10); -- Retry up to 3 times, wait 10s between attempts
-```
-
-### `SELECT cron_delete(name);`
-Deletes a scheduled job.
-
-### `SELECT cron_run(name);`
-Manually executes a job immediately, regardless of its schedule.
-```sql
-SELECT cron_run('job_name');
-```
-
-### `SELECT cron_purge_logs(retention);`
-Purges execution logs older than a specific period. Uses SQLite's [date modifiers](https://www.sqlite.org/lang_datefunc.html).
-```sql
-SELECT cron_purge_logs('-7 days'); -- Keep last 7 days
-SELECT cron_purge_logs('-1 month'); -- Keep last month
-```
-
-### `SELECT cron_status();`
-Returns a JSON object describing the current state of the cron engine.
-```json
-{
-  "mode": "thread",
-  "active": 1,
-  "job_count": 5,
-  "last_check": 1678900000
-}
-```
-
-### `SELECT cron_job_next(name);`
-Returns the next scheduled run time (Unix timestamp) for a specific job.
-
-### `SELECT cron_next_job();`
-Returns the single nearest upcoming job as a JSON object.
-```json
-{"name": "job2", "next_run": 1678902000}
-```
-
-### `SELECT cron_next_job_time();`
-Returns a JSON object mapping all active job names to their next scheduled run times.
-```json
-{"job1": 1678901000, "job2": 1678902000}
-```
-
-### `SELECT cron_reset();`
-Completely resets the global state of the extension (useful for testing).
-
-## Schema
-The extension uses two internal tables:
-- `__cron_jobs`: Stores the schedule and state of jobs.
-- `__cron_log`: Stores the execution history (start time, duration, status, and error messages).
-
-## Features
-
-- **Standard Cron Syntax**: Supports standard cron expressions (e.g., `* * * * *`, `0 9 * * 1-5`) using [ccronexpr](https://github.com/staticlibs/ccronexpr).
-- **Interval Scheduling**: Run jobs every N seconds.
-- **Job Persistence**: Jobs are stored in a table (`__cron_jobs`) and survive restarts.
-- **Execution Logging**: Tracks job execution history in `__cron_log`.
-- **Mode Flexibility**:
-    - **Thread Mode**: Runs in a background thread (requires file-based DB).
-    - **Callback Mode**: Runs synchronously hooked into SQLite's progress handler (works in WASM, in-memory DBs).
-- **Reliability**:
-    - **Retry Logic**: Automatically retry failed jobs with configurable intervals.
-    - **Timeouts**: Terminate long-running jobs.
-    - **Graceful Shutdown**: Ensures cleanup on exit.
-
-## Future Improvements
-- **Cron Syntax**: Support for standard crontab expressions (e.g., `* * * * *`).
-- **Persistence Modes**: Option for transient (in-memory only) jobs.
-- **Retry Logic**: Configurable retry policies for failed jobs.
-
-## Acknowledgments
-- **[pg_cron](https://github.com/citusdata/pg_cron)**: The inspiration for this extension's design and functionality.
-- **[supertinycron](https://github.com/exander77/supertinycron)**: The `ccronexpr` library used for parsing cron expressions is licensed under the Apache License 2.0.
 
 ## License
-MIT License
-
-This project includes code from `ccronexpr` (supertinycron), which is licensed under the Apache License 2.0.
+MIT License.
+Includes code from `ccronexpr` (Apache 2.0).

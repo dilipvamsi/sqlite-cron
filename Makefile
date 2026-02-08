@@ -1,7 +1,7 @@
 # Simple Makefile for sqlite-cron
 CC = gcc
 CC_WIN = x86_64-w64-mingw32-gcc
-CFLAGS = -g -fPIC -O3 -DTEST_MODE -DCRON_USE_LOCAL_TIME -Iheaders -Iexternal
+CFLAGS = -g -fPIC -O3 -DTEST_MODE -Iheaders -Iexternal
 
 
 LDFLAGS_LINUX = -shared -lpthread

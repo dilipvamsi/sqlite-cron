@@ -10,8 +10,6 @@
  */
 
 #include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 
 #if defined(_WIN32) || defined(_WIN64)
 #include <io.h>
@@ -123,15 +121,29 @@ int test_callback_mode(void) {
   sqlite3_exec(db, "SELECT cron_init('callback');", NULL, NULL, NULL);
   sqlite3_exec(db, "SELECT cron_schedule('leak_job', 60, 'SELECT 1;');", NULL,
                NULL, NULL);
+  sqlite3_exec(
+      db,
+      "SELECT cron_schedule_cron('leak_cron', '*/5 * * * * *', 'SELECT 1;');",
+      NULL, NULL, NULL);
   sqlite3_exec(db,
                "SELECT cron_schedule('timeout_job', 30, 'SELECT 2;', 5000);",
                NULL, NULL, NULL);
+  sqlite3_exec(db, "SELECT cron_run('leak_job');", NULL, NULL, NULL);
+  sqlite3_exec(db, "SELECT cron_run('leak_cron');", NULL, NULL, NULL);
   sqlite3_exec(db, "SELECT cron_get('leak_job');", NULL, NULL, NULL);
   sqlite3_exec(db, "SELECT cron_list();", NULL, NULL, NULL);
+  sqlite3_exec(db, "SELECT cron_status();", NULL, NULL, NULL);
+  sqlite3_exec(db, "SELECT cron_next_job();", NULL, NULL, NULL);
+  sqlite3_exec(db, "SELECT cron_next_job_time();", NULL, NULL, NULL);
+  sqlite3_exec(db, "SELECT cron_set_config('test_key', 'test_val');", NULL,
+               NULL, NULL);
+  sqlite3_exec(db, "SELECT cron_get_config('test_key');", NULL, NULL, NULL);
   sqlite3_exec(db, "SELECT cron_pause('leak_job');", NULL, NULL, NULL);
   sqlite3_exec(db, "SELECT cron_resume('leak_job');", NULL, NULL, NULL);
   sqlite3_exec(db, "SELECT cron_update('leak_job', 120);", NULL, NULL, NULL);
+  sqlite3_exec(db, "SELECT cron_purge_logs('-1 day');", NULL, NULL, NULL);
   sqlite3_exec(db, "SELECT cron_delete('leak_job');", NULL, NULL, NULL);
+  sqlite3_exec(db, "SELECT cron_delete('leak_cron');", NULL, NULL, NULL);
   sqlite3_exec(db, "SELECT cron_delete('timeout_job');", NULL, NULL, NULL);
   sqlite3_exec(db, "SELECT cron_stop();", NULL, NULL, NULL);
   sqlite3_exec(db, "SELECT cron_reset();", NULL, NULL, NULL);
@@ -183,6 +195,8 @@ int test_thread_mode(void) {
   SLEEP_MS(100);
 
   sqlite3_exec(db, "SELECT cron_get('thread_job');", NULL, NULL, NULL);
+  sqlite3_exec(db, "SELECT cron_status();", NULL, NULL, NULL);
+  sqlite3_exec(db, "SELECT cron_next_job();", NULL, NULL, NULL);
   sqlite3_exec(db, "SELECT cron_list();", NULL, NULL, NULL);
   sqlite3_exec(db, "SELECT cron_pause('thread_job');", NULL, NULL, NULL);
   sqlite3_exec(db, "SELECT cron_resume('thread_job');", NULL, NULL, NULL);
