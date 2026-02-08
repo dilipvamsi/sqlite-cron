@@ -27,7 +27,7 @@ jobs:
             install_deps: |
               sudo apt-get update
               sudo apt-get install -y libsqlite3-dev
-            build_cmd: make linux CFLAGS="-fPIC -O3 -DCRON_USE_LOCAL_TIME -Iheaders -Iexternal"
+            build_cmd: make linux CFLAGS="-fPIC -O3 -Iheaders -Iexternal"
 
           # 2. Linux ARM64
           - os: ubuntu-latest
@@ -37,7 +37,7 @@ jobs:
               sudo apt-get update
               sudo apt-get install -y gcc-aarch64-linux-gnu libc6-dev-arm64-cross
             # Override CC to use the cross-compiler
-            build_cmd: make linux CC=aarch64-linux-gnu-gcc CFLAGS="-fPIC -O3 -DCRON_USE_LOCAL_TIME -Iheaders -Iexternal" LDFLAGS_LINUX="-shared -Wl,-z,max-page-size=4096"
+            build_cmd: make linux CC=aarch64-linux-gnu-gcc CFLAGS="-fPIC -O3 -Iheaders -Iexternal" LDFLAGS_LINUX="-shared -Wl,-z,max-page-size=4096"
 
           # ==================================================================
           # WINDOWS BUILDS (Cross-compiled from Linux)
@@ -52,7 +52,7 @@ jobs:
               sudo apt-get install -y mingw-w64
             # Use windows-cross target which uses x86_64-w64-mingw32-gcc
             # We override CFLAGS to remove TEST_MODE
-            build_cmd: make windows-cross CFLAGS="-O3 -DCRON_USE_LOCAL_TIME -Iheaders -Iexternal"
+            build_cmd: make windows-cross CFLAGS="-O3 -Iheaders -Iexternal"
 
           # 4. Windows ARM64 (LLVM-MinGW)
           - os: ubuntu-latest
@@ -63,7 +63,7 @@ jobs:
               tar -xf llvm-mingw.tar.xz
               echo "$PWD/llvm-mingw-20231128-ucrt-ubuntu-20.04-x86_64/bin" >> $GITHUB_PATH
             # Reuse windows-cross target but override CC to llvm-mingw's clang
-            build_cmd: make windows-cross CC_WIN=aarch64-w64-mingw32-gcc CFLAGS="-O3 -DCRON_USE_LOCAL_TIME -Iheaders -Iexternal"
+            build_cmd: make windows-cross CC_WIN=aarch64-w64-mingw32-gcc CFLAGS="-O3 -Iheaders -Iexternal"
 
           # ==================================================================
           # MACOS BUILD (Universal: Intel + Apple Silicon)
@@ -78,7 +78,7 @@ jobs:
               # sqlite-cron makefile 'macos' target handles download-ccronexpr
               echo "Ready to build"
             # Standard macos target
-            build_cmd: make macos CFLAGS="-dynamiclib -O3 -DCRON_USE_LOCAL_TIME -Iheaders -Iexternal"
+            build_cmd: make macos CFLAGS="-dynamiclib -O3 -Iheaders -Iexternal"
 
     steps:
       - name: Checkout Code

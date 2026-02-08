@@ -5,7 +5,7 @@ CFLAGS = -g -fPIC -O3 -DTEST_MODE -Iheaders -Iexternal
 
 
 LDFLAGS_LINUX = -shared -lpthread
-LDFLAGS_MAC = -dynamiclib
+LDFLAGS_MAC = -dynamiclib -undefined dynamic_lookup
 LDFLAGS_WIN = -shared
 BUILD_DIR = build
 
