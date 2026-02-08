@@ -219,6 +219,11 @@ typedef pthread_cond_t cron_cond_t;
 #define DEFAULT_POLL_INTERVAL_MS 16000 /* 16 seconds default */
 #endif
 
+/* --- Table Name Constants --- */
+/* These macros allow table names to be easily changed if needed. */
+#define CRON_JOBS_TABLE "__cron_jobs"
+#define CRON_LOG_TABLE "__cron_log"
+
 /**
  * @struct CronControl
  * @brief Global state container for the cron engine.
@@ -236,14 +241,16 @@ typedef struct {
   sqlite3 *worker_db;          /**< Private DB handle for the worker thread */
   cron_mutex_t mutex;          /**< Mutex for thread-safe state access */
   cron_cond_t cond;            /**< Condition variable for fast exit/waking */
-  int ref_count;        /**< Number of active connections using the engine */
-  int poll_interval_ms; /**< Thread poll interval in milliseconds */
+  int ref_count;           /**< Number of active connections using the engine */
+  int callback_opcodes;    /**< Opcodes between checks in callback mode */
+  int callback_rate_limit; /**< Min seconds between checks in callback mode */
+  int poll_interval_ms;    /**< Milliseconds between checks for thread mode */
 } CronControl;
 
 /* Singleton instance of the cron controller */
 static CronControl global_cron = {
-    NULL, 0, 0,    0,   0,   {0, 0}, 0,
-    0,    0, NULL, {0}, {0}, 0,      DEFAULT_POLL_INTERVAL_MS};
+    NULL, 0,    0,   0,   0, {0, 0}, 0, 0,
+    0,    NULL, {0}, {0}, 0, 0,      0, DEFAULT_POLL_INTERVAL_MS};
 
 /* --- The Core Engine --- */
 
@@ -292,8 +299,11 @@ static void cron_tick(sqlite3 *db) {
 
   time_t now = time(NULL);
 
-  /* Rate-limiting */
-  if (now <= global_cron.last_check) {
+  /* Rate-limiting: Only block same-second ticks if a rate limit is enforced.
+   * If rate_limit is 0, we allow multiple ticks per second (throttled by
+   * opcodes).
+   */
+  if (global_cron.callback_rate_limit > 0 && now <= global_cron.last_check) {
     cron_mutex_lock(&global_cron.mutex);
     global_cron.in_tick = 0;
     cron_mutex_unlock(&global_cron.mutex);
@@ -309,15 +319,16 @@ static void cron_tick(sqlite3 *db) {
    */
   const char *query =
       "SELECT name, command, schedule_interval, timeout_ms, cron_expr, "
-      "max_retries, retry_interval_seconds, retries_attempted FROM "
-      "__cron_jobs "
-      "WHERE next_run <= strftime('%s', 'now') AND active = 1;";
+      "max_retries, retry_interval_seconds, retries_attempted "
+      "FROM " CRON_JOBS_TABLE " "
+      "WHERE next_run <= ? AND active = 1;";
 
   cron_job_info *job_head = NULL;
   cron_job_info *job_tail = NULL;
 
   sqlite3_stmt *stmt;
   if (sqlite3_prepare_v2(db, query, -1, &stmt, NULL) == SQLITE_OK) {
+    sqlite3_bind_int64(stmt, 1, (sqlite3_int64)now);
     while (sqlite3_step(stmt) == SQLITE_ROW) {
       cron_job_info *job = (cron_job_info *)malloc(sizeof(cron_job_info));
       if (!job)
@@ -354,6 +365,8 @@ static void cron_tick(sqlite3 *db) {
       }
     }
     sqlite3_finalize(stmt); /* Important: Close read transaction/statement */
+  } else {
+    /* Silent failure in production, could log to __cron_log if needed */
   }
 
   /*
@@ -388,8 +401,9 @@ static void cron_tick(sqlite3 *db) {
       sqlite3_exec(db, "BEGIN IMMEDIATE;", NULL, NULL, NULL);
     }
     sqlite3_stmt *log_stmt;
-    const char *log_sql = "INSERT INTO __cron_log (job_name, start_time, "
-                          "status) VALUES (?, ?, 'RUNNING');";
+    const char *log_sql =
+        "INSERT INTO " CRON_LOG_TABLE " (job_name, start_time, "
+        "status) VALUES (?, ?, 'RUNNING');";
     sqlite3_int64 log_id = 0;
     if (sqlite3_prepare_v2(db, log_sql, -1, &log_stmt, NULL) == SQLITE_OK) {
       sqlite3_bind_text(log_stmt, 1, name, -1, SQLITE_TRANSIENT);
@@ -408,6 +422,7 @@ static void cron_tick(sqlite3 *db) {
      */
     char *err_msg = NULL;
     int rc = sqlite3_exec(db, cmd, NULL, NULL, &err_msg);
+
     global_cron.in_job = 0; /* Clear flag immediately to allow logging */
 
     struct timeval t_end;
@@ -483,8 +498,9 @@ static void cron_tick(sqlite3 *db) {
 
     /* Update Log */
     if (log_id > 0) {
-      const char *upd_log = "UPDATE __cron_log SET status = ?, end_time = ?, "
-                            "duration_ms = ?, error_message = ? WHERE id = ?;";
+      const char *upd_log =
+          "UPDATE " CRON_LOG_TABLE " SET status = ?, end_time = ?, "
+          "duration_ms = ?, error_message = ? WHERE id = ?;";
       if (sqlite3_prepare_v2(db, upd_log, -1, &upd_stmt, NULL) == SQLITE_OK) {
         sqlite3_bind_text(upd_stmt, 1, status_str, -1, SQLITE_TRANSIENT);
         sqlite3_bind_int64(upd_stmt, 2, (time_t)t_end.tv_sec);
@@ -500,7 +516,7 @@ static void cron_tick(sqlite3 *db) {
       }
     }
 
-    const char *upd_sql = "UPDATE __cron_jobs SET next_run = ?, "
+    const char *upd_sql = "UPDATE " CRON_JOBS_TABLE " SET next_run = ?, "
                           "retries_attempted = ? WHERE name = ?;";
     if (sqlite3_prepare_v2(db, upd_sql, -1, &upd_stmt, NULL) == SQLITE_OK) {
       sqlite3_bind_int64(upd_stmt, 1, (sqlite3_int64)next_run_time);
@@ -553,9 +569,6 @@ static int cron_progress_handler(void *arg) {
         (now.tv_sec - global_cron.job_start_time.tv_sec) * 1000LL +
         (now.tv_usec - global_cron.job_start_time.tv_usec) / 1000LL;
 
-#ifdef TEST_MODE
-#endif
-
     if (elapsed >= global_cron.current_timeout_ms) {
       return 1; /* Terminate the currently running query */
     }
@@ -566,7 +579,7 @@ static int cron_progress_handler(void *arg) {
     time_t now = time(NULL);
 
     /* Strictly enforce the rate limit for callback mode to prevent overhead */
-    if (now - global_cron.last_check < CALLBACK_RATE_LIMIT)
+    if (now - global_cron.last_check < global_cron.callback_rate_limit)
       return 0;
 
     cron_tick((sqlite3 *)arg);
@@ -599,8 +612,7 @@ static void *cron_thread_worker(void *arg) {
 
   cron_mutex_lock(&global_cron.mutex);
   global_cron.worker_db = worker_db;
-#ifdef TEST_MODE
-#endif
+
   cron_mutex_unlock(&global_cron.mutex); /* Release before loop */
 
   while (global_cron.active) {
@@ -608,8 +620,7 @@ static void *cron_thread_worker(void *arg) {
 
     cron_mutex_lock(&global_cron.mutex);
     if (!global_cron.active) {
-#ifdef TEST_MODE
-#endif
+
       cron_mutex_unlock(&global_cron.mutex);
       break;
     }
@@ -650,9 +661,6 @@ static void cron_shutdown_internal(void) {
   if (global_cron.ref_count > 0) {
     global_cron.ref_count--;
   }
-
-#ifdef TEST_MODE
-#endif
 
   /* Step 2: If other connections still using engine, keep it running */
   if (global_cron.ref_count > 0) {
@@ -815,27 +823,54 @@ static void cron_init_func(sqlite3_context *context, int argc,
       sqlite3_result_error(context, "Failed to create thread", -1);
       return;
     }
-
     sqlite3_result_text(context, "Initialized: Thread mode", -1, SQLITE_STATIC);
+
   } else if (strcmp(mode_str, "callback") == 0) {
-    /* Callback mode doesn't use poll interval */
-    if (argc >= 2 && sqlite3_value_type(argv[1]) == SQLITE_INTEGER) {
+    /* If already initialized in a different mode, reject */
+    if (global_cron.active && global_cron.mode != 2) {
       global_cron.ref_count--;
       cron_mutex_unlock(&global_cron.mutex);
-      sqlite3_result_error(context,
-                           "Poll interval not supported in callback mode. Use "
-                           "cron_init('callback') only.",
+      sqlite3_result_error(context, "Cron already initialized in 'thread' mode",
                            -1);
       return;
     }
+
+    /* Set defaults or preserve existing if already active?
+     * Better to overwrite with defaults then re-parse for consistency. */
+    global_cron.callback_opcodes = CALLBACK_OPCODES;
+    global_cron.callback_rate_limit = CALLBACK_RATE_LIMIT;
+
+    /* Parse optional parameters for callback mode
+     * argv[1] = rate_limit_seconds, argv[2] = opcode_threshold
+     */
+    if (argc >= 2 && sqlite3_value_type(argv[1]) == SQLITE_INTEGER) {
+      global_cron.callback_rate_limit = sqlite3_value_int(argv[1]);
+    }
+    if (argc >= 3 && sqlite3_value_type(argv[2]) == SQLITE_INTEGER) {
+      global_cron.callback_opcodes = sqlite3_value_int(argv[2]);
+    }
+
+    /* If already active, just return success after updating params */
+    if (global_cron.active) {
+      sqlite3_progress_handler(db, global_cron.callback_opcodes,
+                               cron_progress_handler, db);
+      global_cron.last_check =
+          0; /* Important: allow immediate tick after reconfig */
+      cron_mutex_unlock(&global_cron.mutex);
+      sqlite3_result_text(context, "Cron reconfigured: Callback mode", -1,
+                          SQLITE_STATIC);
+      return;
+    }
+
     /* Set up as callback mode using the progress handler */
     global_cron.mode = 2;
     global_cron.active = 1;
-    sqlite3_progress_handler(db, CALLBACK_OPCODES, cron_progress_handler, db);
+    sqlite3_progress_handler(db, global_cron.callback_opcodes,
+                             cron_progress_handler, db);
     sqlite3_result_text(context, "Initialized: Callback mode", -1,
                         SQLITE_STATIC);
   } else {
-    /* Unknown mode - reject with error */
+    /* Unknown mode */
     global_cron.ref_count--;
     cron_mutex_unlock(&global_cron.mutex);
     sqlite3_result_error(context, "Unknown mode: use 'thread' or 'callback'",
@@ -843,6 +878,9 @@ static void cron_init_func(sqlite3_context *context, int argc,
     return;
   }
 
+  /* Reset last_check after initialization to ensure the first tick
+   * can happen immediately in the same second. */
+  global_cron.last_check = 0;
   cron_mutex_unlock(&global_cron.mutex);
 
   /* Register a sentinel function to detect connection closure.
@@ -866,18 +904,34 @@ static void cron_schedule_func(sqlite3_context *context, int argc,
   int timeout_ms = (argc == 4) ? sqlite3_value_int(argv[3]) : 0;
   sqlite3 *db = sqlite3_context_db_handle(context);
 
+  time_t now = time(NULL);
+  time_t next_run = now + interval;
+
   sqlite3_stmt *stmt;
-  const char *sql =
-      "INSERT INTO __cron_jobs (name, command, schedule_interval, next_run, "
-      "active, timeout_ms) VALUES (?, ?, ?, strftime('%s', 'now'), 1, ?);";
+  const char *sql = "INSERT INTO " CRON_JOBS_TABLE
+                    " (name, command, schedule_interval, next_run, "
+                    "active, timeout_ms) VALUES (?, ?, ?, ?, 1, ?);";
 
   if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK) {
     sqlite3_bind_text(stmt, 1, name, -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt, 2, cmd, -1, SQLITE_TRANSIENT);
     sqlite3_bind_int(stmt, 3, interval);
-    sqlite3_bind_int(stmt, 4, timeout_ms);
+    sqlite3_bind_int64(stmt, 4, (sqlite3_int64)next_run);
+    sqlite3_bind_int(stmt, 5, timeout_ms);
 
-    if (sqlite3_step(stmt) == SQLITE_DONE) {
+    /* Set in_tick to prevent progress handler from triggering cron_tick during
+     * our own write */
+    cron_mutex_lock(&global_cron.mutex);
+    global_cron.in_tick = 1;
+    cron_mutex_unlock(&global_cron.mutex);
+
+    int rc = sqlite3_step(stmt);
+
+    cron_mutex_lock(&global_cron.mutex);
+    global_cron.in_tick = 0;
+    cron_mutex_unlock(&global_cron.mutex);
+
+    if (rc == SQLITE_DONE) {
       sqlite3_result_int64(context, sqlite3_last_insert_rowid(db));
     } else {
       sqlite3_result_error(context, sqlite3_errmsg(db), -1);
@@ -944,7 +998,7 @@ static void cron_schedule_cron_func(sqlite3_context *context, int argc,
 
   /* 4. Insert Job */
   sqlite3_stmt *stmt;
-  const char *sql = "INSERT OR REPLACE INTO __cron_jobs "
+  const char *sql = "INSERT INTO " CRON_JOBS_TABLE " "
                     "(name, command, schedule_interval, cron_expr, next_run, "
                     "active, timeout_ms) "
                     "VALUES (?, ?, 0, ?, ?, 1, ?);";
@@ -957,7 +1011,19 @@ static void cron_schedule_cron_func(sqlite3_context *context, int argc,
     sqlite3_bind_int64(stmt, 4, (sqlite3_int64)next_run);
     sqlite3_bind_int(stmt, 5, timeout_ms);
 
-    if (sqlite3_step(stmt) == SQLITE_DONE) {
+    /* Set in_tick to prevent progress handler from triggering cron_tick during
+     * our own write */
+    cron_mutex_lock(&global_cron.mutex);
+    global_cron.in_tick = 1;
+    cron_mutex_unlock(&global_cron.mutex);
+
+    int rc = sqlite3_step(stmt);
+
+    cron_mutex_lock(&global_cron.mutex);
+    global_cron.in_tick = 0;
+    cron_mutex_unlock(&global_cron.mutex);
+
+    if (rc == SQLITE_DONE) {
       sqlite3_result_text(context, name, -1, SQLITE_TRANSIENT);
       /* Wake up worker */
       cron_mutex_lock(&global_cron.mutex);
@@ -980,8 +1046,9 @@ static void cron_pause_func(sqlite3_context *context, int argc,
   const char *name = (const char *)sqlite3_value_text(argv[0]);
   sqlite3 *db = sqlite3_context_db_handle(context);
   sqlite3_stmt *stmt;
-  sqlite3_prepare_v2(db, "UPDATE __cron_jobs SET active = 0 WHERE name = ?;",
-                     -1, &stmt, NULL);
+  sqlite3_prepare_v2(
+      db, "UPDATE " CRON_JOBS_TABLE " SET active = 0 WHERE name = ?;", -1,
+      &stmt, NULL);
   sqlite3_bind_text(stmt, 1, name, -1, SQLITE_TRANSIENT);
   sqlite3_step(stmt);
   sqlite3_result_int(context, sqlite3_changes(db) > 0);
@@ -996,8 +1063,9 @@ static void cron_resume_func(sqlite3_context *context, int argc,
   const char *name = (const char *)sqlite3_value_text(argv[0]);
   sqlite3 *db = sqlite3_context_db_handle(context);
   sqlite3_stmt *stmt;
-  sqlite3_prepare_v2(db, "UPDATE __cron_jobs SET active = 1 WHERE name = ?;",
-                     -1, &stmt, NULL);
+  sqlite3_prepare_v2(
+      db, "UPDATE " CRON_JOBS_TABLE " SET active = 1 WHERE name = ?;", -1,
+      &stmt, NULL);
   sqlite3_bind_text(stmt, 1, name, -1, SQLITE_TRANSIENT);
   sqlite3_step(stmt);
   sqlite3_result_int(context, sqlite3_changes(db) > 0);
@@ -1013,8 +1081,8 @@ static void cron_delete_func(sqlite3_context *context, int argc,
   sqlite3 *db = sqlite3_context_db_handle(context);
 
   sqlite3_stmt *stmt;
-  sqlite3_prepare_v2(db, "DELETE FROM __cron_jobs WHERE name = ?;", -1, &stmt,
-                     NULL);
+  sqlite3_prepare_v2(db, "DELETE FROM " CRON_JOBS_TABLE " WHERE name = ?;", -1,
+                     &stmt, NULL);
   sqlite3_bind_text(stmt, 1, name, -1, SQLITE_TRANSIENT);
   sqlite3_step(stmt);
 
@@ -1031,9 +1099,10 @@ static void cron_update_func(sqlite3_context *context, int argc,
   int interval = sqlite3_value_int(argv[1]);
   sqlite3 *db = sqlite3_context_db_handle(context);
   sqlite3_stmt *stmt;
-  sqlite3_prepare_v2(
-      db, "UPDATE __cron_jobs SET schedule_interval = ? WHERE name = ?;", -1,
-      &stmt, NULL);
+  sqlite3_prepare_v2(db,
+                     "UPDATE " CRON_JOBS_TABLE
+                     " SET schedule_interval = ? WHERE name = ?;",
+                     -1, &stmt, NULL);
   sqlite3_bind_int(stmt, 1, interval);
   sqlite3_bind_text(stmt, 2, name, -1, SQLITE_TRANSIENT);
   sqlite3_step(stmt);
@@ -1055,7 +1124,8 @@ static void cron_get_func(sqlite3_context *context, int argc,
   sqlite3_stmt *stmt;
   sqlite3_prepare_v2(db,
                      "SELECT name, command, schedule_interval, active, "
-                     "next_run, cron_expr FROM __cron_jobs WHERE name = ?;",
+                     "next_run, cron_expr FROM " CRON_JOBS_TABLE
+                     " WHERE name = ?;",
                      -1, &stmt, NULL);
   sqlite3_bind_text(stmt, 1, name, -1, SQLITE_TRANSIENT);
 
@@ -1084,7 +1154,7 @@ static void cron_list_func(sqlite3_context *context, int argc,
   sqlite3_stmt *stmt;
   sqlite3_prepare_v2(db,
                      "SELECT name, command, schedule_interval, active, "
-                     "next_run, cron_expr FROM __cron_jobs;",
+                     "next_run, cron_expr FROM " CRON_JOBS_TABLE ";",
                      -1, &stmt, NULL);
 
   char *json = sqlite3_mprintf("[");
@@ -1155,6 +1225,9 @@ static void cron_reset_func(sqlite3_context *context, int argc,
  *    -- Use 'callback' mode for synchronous execution (e.g., inside WASM or
  * highly restricted envs) SELECT cron_init('callback');
  *
+ *    -- Use 'callback' with custom parameters (rate limit: 1 sec, threshold: 10
+ * opcodes) SELECT cron_init('callback', 1, 10);
+ *
  * 2. Schedule a Recurring Job
  *    -- Run 'my_job' every 10 seconds
  *    SELECT cron_schedule('my_job', 10, 'INSERT INTO log VALUES
@@ -1200,6 +1273,206 @@ static void cron_reset_func(sqlite3_context *context, int argc,
  * functions.
  */
 /**
+ * @brief Manually executes a job immediately.
+ * Usage: SELECT cron_run('job_name');
+ */
+static void cron_run_func(sqlite3_context *context, int argc,
+                          sqlite3_value **argv) {
+  const char *name = (const char *)sqlite3_value_text(argv[0]);
+  sqlite3 *db = sqlite3_context_db_handle(context);
+  sqlite3_stmt *stmt;
+  const char *sql = "SELECT command FROM " CRON_JOBS_TABLE " WHERE name = ?;";
+
+  if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+    sqlite3_result_error(context, sqlite3_errmsg(db), -1);
+    return;
+  }
+
+  sqlite3_bind_text(stmt, 1, name, -1, SQLITE_TRANSIENT);
+
+  if (sqlite3_step(stmt) == SQLITE_ROW) {
+    const char *cmd = (const char *)sqlite3_column_text(stmt, 0);
+    char *err_msg = NULL;
+    int rc = sqlite3_exec(db, cmd, NULL, NULL, &err_msg);
+    if (rc != SQLITE_OK) {
+      sqlite3_result_error(context, err_msg, -1);
+      sqlite3_free(err_msg);
+    } else {
+      sqlite3_result_int(context, 1); /* Success */
+    }
+  } else {
+    sqlite3_result_error(context, "Job not found", -1);
+  }
+  sqlite3_finalize(stmt);
+}
+
+/**
+ * @brief Purges logs older than a specific retention period.
+ * Usage: SELECT cron_purge_logs('-7 days');
+ */
+static void cron_purge_logs_func(sqlite3_context *context, int argc,
+                                 sqlite3_value **argv) {
+  const char *modifier = (const char *)sqlite3_value_text(argv[0]);
+  sqlite3 *db = sqlite3_context_db_handle(context);
+  sqlite3_stmt *stmt;
+
+  /* Use SQLite's datetime('now', modifier) to verify modifier is valid?
+   * Actually, let's just bind it to the DELETE statement directly.
+   * DELETE FROM __cron_log WHERE start_time < strftime('%s', 'now', ?);
+   * Wait, start_time is INTEGER (unix epoch).
+   * So we need strict comparison: start_time < strftime('%s', 'now', modifier)
+   */
+  const char *sql = "DELETE FROM " CRON_LOG_TABLE
+                    " WHERE start_time < strftime('%s', 'now', ?);";
+
+  if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+    sqlite3_result_error(context, sqlite3_errmsg(db), -1);
+    return;
+  }
+
+  sqlite3_bind_text(stmt, 1, modifier, -1, SQLITE_TRANSIENT);
+  int rc = sqlite3_step(stmt);
+  if (rc == SQLITE_DONE) {
+    sqlite3_result_int(context, sqlite3_changes(db));
+  } else {
+    sqlite3_result_error(context, sqlite3_errmsg(db), -1);
+  }
+  sqlite3_finalize(stmt);
+}
+
+/**
+ * @brief Returns the next run time for a specific job.
+ * Usage: SELECT cron_job_next('job_name');
+ */
+static void cron_job_next_func(sqlite3_context *context, int argc,
+                               sqlite3_value **argv) {
+  const char *name = (const char *)sqlite3_value_text(argv[0]);
+  sqlite3 *db = sqlite3_context_db_handle(context);
+  sqlite3_stmt *stmt;
+  const char *sql = "SELECT next_run FROM " CRON_JOBS_TABLE " WHERE name = ?;";
+
+  if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+    sqlite3_result_error(context, sqlite3_errmsg(db), -1);
+    return;
+  }
+
+  sqlite3_bind_text(stmt, 1, name, -1, SQLITE_TRANSIENT);
+
+  if (sqlite3_step(stmt) == SQLITE_ROW) {
+    sqlite3_result_int64(context, sqlite3_column_int64(stmt, 0));
+  } else {
+    sqlite3_result_null(context); /* Job not found */
+  }
+  sqlite3_finalize(stmt);
+}
+
+/**
+ * @brief Returns a JSON object with all jobs and their next run times.
+ * Usage: SELECT cron_next_job_time();
+ */
+static void cron_next_job_time_func(sqlite3_context *context, int argc,
+                                    sqlite3_value **argv) {
+  sqlite3 *db = sqlite3_context_db_handle(context);
+  sqlite3_stmt *stmt;
+  const char *sql =
+      "SELECT name, next_run FROM " CRON_JOBS_TABLE " WHERE active = 1;";
+
+  if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+    sqlite3_result_error(context, sqlite3_errmsg(db), -1);
+    return;
+  }
+
+  char *json = sqlite3_mprintf("{");
+  int first = 1;
+
+  while (sqlite3_step(stmt) == SQLITE_ROW) {
+    const char *name = (const char *)sqlite3_column_text(stmt, 0);
+    sqlite3_int64 next_run = sqlite3_column_int64(stmt, 1);
+
+    char *tmp;
+    if (first) {
+      tmp = sqlite3_mprintf("%z\"%q\": %lld", json, name, next_run);
+      first = 0;
+    } else {
+      tmp = sqlite3_mprintf("%z, \"%q\": %lld", json, name, next_run);
+    }
+    json = tmp;
+  }
+  sqlite3_finalize(stmt);
+
+  char *final_json = sqlite3_mprintf("%z}", json);
+
+  sqlite3_result_text(context, final_json, -1, SQLITE_TRANSIENT);
+  sqlite3_free(final_json);
+}
+
+/**
+ * @brief Returns the nearest upcoming job.
+ * Usage: SELECT cron_next_job();
+ */
+static void cron_next_job_func(sqlite3_context *context, int argc,
+                               sqlite3_value **argv) {
+  sqlite3 *db = sqlite3_context_db_handle(context);
+  sqlite3_stmt *stmt;
+  const char *sql = "SELECT name, next_run FROM " CRON_JOBS_TABLE
+                    " WHERE active = 1 ORDER BY next_run ASC LIMIT 1;";
+
+  if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+    sqlite3_result_error(context, sqlite3_errmsg(db), -1);
+    return;
+  }
+
+  if (sqlite3_step(stmt) == SQLITE_ROW) {
+    const char *name = (const char *)sqlite3_column_text(stmt, 0);
+    sqlite3_int64 next_run = sqlite3_column_int64(stmt, 1);
+    char *json = sqlite3_mprintf("{\"name\": \"%q\", \"next_run\": %lld}", name,
+                                 next_run);
+    sqlite3_result_text(context, json, -1, SQLITE_TRANSIENT);
+    sqlite3_free(json);
+  } else {
+    sqlite3_result_null(context);
+  }
+  sqlite3_finalize(stmt);
+}
+
+/**
+ * @brief Returns the status of the cron engine as JSON.
+ * Usage: SELECT cron_status();
+ */
+static void cron_status_func(sqlite3_context *context, int argc,
+                             sqlite3_value **argv) {
+  sqlite3 *db = sqlite3_context_db_handle(context);
+
+  /* Get active job count */
+  sqlite3_stmt *stmt;
+  int job_count = 0;
+  if (sqlite3_prepare_v2(
+          db, "SELECT count(*) FROM " CRON_JOBS_TABLE " WHERE active=1;", -1,
+          &stmt, NULL) == SQLITE_OK) {
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+      job_count = sqlite3_column_int(stmt, 0);
+    }
+    sqlite3_finalize(stmt);
+  }
+
+  /* Use locally cached mode/active from global_cron */
+  cron_mutex_lock(&global_cron.mutex);
+  int mode = global_cron.mode;
+  int active = global_cron.active;
+  time_t last_check = global_cron.last_check;
+  cron_mutex_unlock(&global_cron.mutex);
+
+  char *json = sqlite3_mprintf("{\"mode\": \"%s\", \"active\": %d, "
+                               "\"job_count\": %d, \"last_check\": %lld}",
+                               (mode == 1) ? "thread"
+                                           : (mode == 2 ? "callback" : "none"),
+                               active, job_count, (long long)last_check);
+
+  sqlite3_result_text(context, json, -1, SQLITE_TRANSIENT);
+  sqlite3_free(json);
+}
+
+/**
  * @brief Configures retry logic for a specific job.
  *
  * Usage: SELECT cron_set_retry('job_name', max_retries,
@@ -1219,7 +1492,7 @@ static void cron_set_retry_func(sqlite3_context *context, int argc,
   sqlite3 *db = sqlite3_context_db_handle(context);
   sqlite3_stmt *stmt;
   sqlite3_prepare_v2(db,
-                     "UPDATE __cron_jobs SET max_retries = ?, "
+                     "UPDATE " CRON_JOBS_TABLE " SET max_retries = ?, "
                      "retry_interval_seconds = ? WHERE name = ?;",
                      -1, &stmt, NULL);
   sqlite3_bind_int(stmt, 1, max_retries);
@@ -1239,7 +1512,7 @@ int sqlite3_sqlitecron_init(sqlite3 *db, char **pzErrMsg,
 
   /* Initialize job definition table with all columns */
   sqlite3_exec(db,
-               "CREATE TABLE IF NOT EXISTS __cron_jobs ("
+               "CREATE TABLE IF NOT EXISTS " CRON_JOBS_TABLE " ("
                "  name TEXT PRIMARY KEY,"
                "  command TEXT,"
                "  schedule_interval INTEGER,"
@@ -1256,7 +1529,7 @@ int sqlite3_sqlitecron_init(sqlite3 *db, char **pzErrMsg,
 
   /* Initialize execution log table with all columns */
   sqlite3_exec(db,
-               "CREATE TABLE IF NOT EXISTS __cron_log ("
+               "CREATE TABLE IF NOT EXISTS " CRON_LOG_TABLE " ("
                "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
                "  job_name TEXT,"
                "  start_time INTEGER,"
@@ -1268,14 +1541,17 @@ int sqlite3_sqlitecron_init(sqlite3 *db, char **pzErrMsg,
                0, 0, 0);
 
   /* Crash Recovery: Clean up stale RUNNING logs */
-  sqlite3_exec(
-      db, "UPDATE __cron_log SET status = 'CRASHED' WHERE status = 'RUNNING';",
-      0, 0, 0);
+  sqlite3_exec(db,
+               "UPDATE " CRON_LOG_TABLE
+               " SET status = 'CRASHED' WHERE status = 'RUNNING';",
+               0, 0, 0);
 
   /* Register all functions with SQLite */
   sqlite3_create_function(db, "cron_init", 1, SQLITE_UTF8, NULL, cron_init_func,
                           NULL, NULL);
   sqlite3_create_function(db, "cron_init", 2, SQLITE_UTF8, NULL, cron_init_func,
+                          NULL, NULL);
+  sqlite3_create_function(db, "cron_init", 3, SQLITE_UTF8, NULL, cron_init_func,
                           NULL, NULL);
   sqlite3_create_function(db, "cron_stop", 0, SQLITE_UTF8, NULL, cron_stop_func,
                           NULL, NULL);
@@ -1304,6 +1580,19 @@ int sqlite3_sqlitecron_init(sqlite3 *db, char **pzErrMsg,
                           cron_reset_func, NULL, NULL);
   sqlite3_create_function(db, "cron_set_retry", 3, SQLITE_UTF8, NULL,
                           cron_set_retry_func, NULL, NULL);
+
+  sqlite3_create_function(db, "cron_run", 1, SQLITE_UTF8, NULL, cron_run_func,
+                          NULL, NULL);
+  sqlite3_create_function(db, "cron_purge_logs", 1, SQLITE_UTF8, NULL,
+                          cron_purge_logs_func, NULL, NULL);
+  sqlite3_create_function(db, "cron_job_next", 1, SQLITE_UTF8, NULL,
+                          cron_job_next_func, NULL, NULL);
+  sqlite3_create_function(db, "cron_next_job", 0, SQLITE_UTF8, NULL,
+                          cron_next_job_func, NULL, NULL);
+  sqlite3_create_function(db, "cron_next_job_time", 0, SQLITE_UTF8, NULL,
+                          cron_next_job_time_func, NULL, NULL);
+  sqlite3_create_function(db, "cron_status", 0, SQLITE_UTF8, NULL,
+                          cron_status_func, NULL, NULL);
 
   /* Initialize mutex and cond var once */
   static int once = 0;

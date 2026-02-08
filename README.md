@@ -96,17 +96,20 @@ make test
 3. Run the tests: `pytest tests/test_cron.py`
 
 
-### `SELECT cron_init(mode);` or `SELECT cron_init(mode, poll_seconds);`
+### `SELECT cron_init(mode, [p1], [p2]);`
 Initializes the cron engine.
 - `mode`:
-  - `thread`: (Recommended) Spawns a background OS thread. Best for disk-based databases. Requires WAL mode (`PRAGMA journal_mode=WAL`).
-  - `callback`: No extra threads. Piggybacks on your existing queries. Best for in-memory databases.
-- `poll_seconds` (optional): How often the thread checks for due jobs. Default is **16 seconds**. Lower values = more precision, higher CPU usage.
+  - `thread`: (Recommended) Spawns a background OS thread.
+  - `callback`: Piggybacks on your existing queries.
+- **Thread Parameters** (`p1`):
+  - `poll_seconds`: How often the thread checks for jobs (default 16s).
+- **Callback Parameters** (`p1`, `p2`):
+  - `rate_limit_seconds`: Minimum seconds between checks (default 1s).
+  - `opcode_threshold`: Number of SQL opcodes between progress callbacks (default 100 in production, 1 in test).
 
 ```sql
-SELECT cron_init('thread');       -- Default 16 second poll
-SELECT cron_init('thread', 4);    -- 4 second poll for sub-minute jobs
-SELECT cron_init('callback');     -- Callback mode (no poll interval)
+SELECT cron_init('thread', 4);    -- Thread mode, 4s poll
+SELECT cron_init('callback', 1, 10); -- Callback mode, 1s limit, check every 10 opcodes
 ```
 
 ### `SELECT cron_schedule(name, seconds, sql_command, [timeout_ms]);`
@@ -160,6 +163,45 @@ SELECT cron_set_retry('unstable_job', 3, 10); -- Retry up to 3 times, wait 10s b
 
 ### `SELECT cron_delete(name);`
 Deletes a scheduled job.
+
+### `SELECT cron_run(name);`
+Manually executes a job immediately, regardless of its schedule.
+```sql
+SELECT cron_run('job_name');
+```
+
+### `SELECT cron_purge_logs(retention);`
+Purges execution logs older than a specific period. Uses SQLite's [date modifiers](https://www.sqlite.org/lang_datefunc.html).
+```sql
+SELECT cron_purge_logs('-7 days'); -- Keep last 7 days
+SELECT cron_purge_logs('-1 month'); -- Keep last month
+```
+
+### `SELECT cron_status();`
+Returns a JSON object describing the current state of the cron engine.
+```json
+{
+  "mode": "thread",
+  "active": 1,
+  "job_count": 5,
+  "last_check": 1678900000
+}
+```
+
+### `SELECT cron_job_next(name);`
+Returns the next scheduled run time (Unix timestamp) for a specific job.
+
+### `SELECT cron_next_job();`
+Returns the single nearest upcoming job as a JSON object.
+```json
+{"name": "job2", "next_run": 1678902000}
+```
+
+### `SELECT cron_next_job_time();`
+Returns a JSON object mapping all active job names to their next scheduled run times.
+```json
+{"job1": 1678901000, "job2": 1678902000}
+```
 
 ### `SELECT cron_reset();`
 Completely resets the global state of the extension (useful for testing).

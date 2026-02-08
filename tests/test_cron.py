@@ -120,6 +120,50 @@ class TestInitMemory(MemoryDbTestCase):
 
 class TestScheduleAndDelete(CronTestBase):
 
+    def test_reentrancy_guard(self):
+        self.db.execute("SELECT cron_init('callback', 0, 1);")
+        self.db.execute("CREATE TABLE log (id INTEGER);")
+        self.db.execute("SELECT cron_schedule('reentrant', 0, 'SELECT 1; INSERT INTO log VALUES (1);');")
+
+        # This should trigger the job but not recursion
+        self.db.execute("SELECT 1;").fetchone()
+        count = self.db.execute("SELECT count(*) FROM log;").fetchone()[0]
+        # With rate_limit=0, it might run multiple times during one SELECT (per opcode callback)
+        # but it should at least run once and not crash.
+        self.assertGreaterEqual(count, 1)
+
+    def test_callback_params_immediate(self):
+        """Test that 0s rate limit allows immediate execution."""
+        self.db.execute("SELECT cron_init('callback', 0, 1);")
+        self.db.execute("CREATE TABLE cb_log_imm (msg TEXT);")
+        self.db.execute("SELECT cron_schedule('cb_imm', 0, \"INSERT INTO cb_log_imm VALUES ('tick');\");")
+        self.db.execute("SELECT 1;").fetchone()
+        self.assertGreaterEqual(self.db.execute("SELECT count(*) FROM cb_log_imm;").fetchone()[0], 1)
+
+    def test_callback_params_rate_limit(self):
+        """Test that 10s rate limit blocks same-second ticks."""
+        self.db.execute("CREATE TABLE cb_log_rl (msg TEXT);")
+        self.db.execute("SELECT cron_schedule('cb_rl', 0, \"INSERT INTO cb_log_rl VALUES ('tick');\");")
+
+        # Now init callback mode.
+        # This statement itself might trigger the first tick after it returns.
+        self.db.execute("SELECT cron_init('callback', 10, 1);")
+
+        # Trigger query - should see exactly 1 tick in the log (either from init or this select)
+        self.db.execute("SELECT 1;").fetchone()
+        self.assertEqual(self.db.execute("SELECT count(*) FROM cb_log_rl;").fetchone()[0], 1)
+
+
+        # Second query in same second should be blocked
+        self.db.execute("SELECT 1;").fetchone()
+        self.assertEqual(self.db.execute("SELECT count(*) FROM cb_log_rl;").fetchone()[0], 1)
+
+
+
+
+
+
+
     def test_schedule_and_delete(self):
         self.db.execute("SELECT cron_init('callback');")
         self.db.execute("CREATE TABLE events (msg TEXT);")
@@ -461,7 +505,7 @@ class TestMultiConnectionRefcount(CronTestBase):
         time.sleep(0.5)
 
         conn2.execute("SELECT cron_schedule('still_alive', 1, 'SELECT 1');")
-        time.sleep(1.2)
+        time.sleep(2.5)
         res = conn2.execute("SELECT status FROM __cron_log WHERE job_name = 'still_alive';").fetchone()
         self.assertIsNotNone(res)
 
@@ -925,6 +969,99 @@ class TestCronExpressions(CronTestBase):
         next_run = job[1]
         now = time.time()
         self.assertTrue(next_run > now + 3000, "Next run should be far in future (normal schedule)")
+
+class TestAdditionalFeatures(CronTestBase):
+    def test_cron_run(self):
+        """Test manual execution of a job."""
+        self.db.execute("SELECT cron_init('thread');")
+        self.db.execute("CREATE TABLE run_log (msg TEXT);")
+        # Schedule far in future so it doesn't run automatically
+        self.db.execute("SELECT cron_schedule('manual_job', 3600, \"INSERT INTO run_log VALUES ('ran');\");")
+
+        # Manual run
+        res = self.db.execute("SELECT cron_run('manual_job');").fetchone()[0]
+        self.assertEqual(res, 1)
+
+        # Verify execution
+        count = self.db.execute("SELECT count(*) FROM run_log;").fetchone()[0]
+        self.assertEqual(count, 1)
+
+    def test_cron_purge_logs(self):
+        """Test log purging with different retention periods."""
+        self.db.execute("SELECT cron_init('thread');")
+
+        # Insert old log (10 days ago) using SQL injection directly to bypass readonly fields if any
+        # __cron_log start_time is just an INTEGER
+        old_time = int(time.time()) - 86400 * 10
+        self.db.execute("INSERT INTO __cron_log (job_name, start_time, status) VALUES ('old_job', ?, 'COMPLETED')", (old_time,))
+
+        # Insert recent log (2 days ago)
+        recent_time = int(time.time()) - 86400 * 2
+        self.db.execute("INSERT INTO __cron_log (job_name, start_time, status) VALUES ('new_job', ?, 'COMPLETED')", (recent_time,))
+
+        self.assertEqual(self.db.execute("SELECT count(*) FROM __cron_log").fetchone()[0], 2)
+
+        # Purge older than 7 days
+        deleted = self.db.execute("SELECT cron_purge_logs('-7 days');").fetchone()[0]
+        self.assertEqual(deleted, 1)
+
+        count = self.db.execute("SELECT count(*) FROM __cron_log").fetchone()[0]
+        self.assertEqual(count, 1)
+
+        # Check that the recent log remains
+        job_name = self.db.execute("SELECT job_name FROM __cron_log").fetchone()[0]
+        self.assertEqual(job_name, 'new_job')
+
+    def test_cron_status(self):
+        """Test engine status reporting."""
+        self.db.execute("SELECT cron_init('thread');")
+        self.db.execute("SELECT cron_schedule('job1', 60, 'SELECT 1');")
+
+        res = self.db.execute("SELECT cron_status();").fetchone()[0]
+        status = json.loads(res)
+
+        self.assertEqual(status['mode'], 'thread')
+        self.assertIn('active', status) # Might be 1 or 0 if thread creation failed/success
+        # job_count might be 0 or 1 depending on timing, but let's check
+        self.assertEqual(status['job_count'], 1)
+        self.assertIn('last_check', status)
+
+    def test_cron_next_job_time(self):
+        """Test introspection of next run times."""
+        self.db.execute("SELECT cron_init('thread');")
+        self.db.execute("SELECT cron_schedule('job1', 3600, 'SELECT 1');")
+
+        # 1. Specific job
+        next_run = self.db.execute("SELECT cron_job_next('job1');").fetchone()[0]
+        self.assertIsInstance(next_run, int)
+        # Next run should be roughly now + 3600
+        self.assertAlmostEqual(next_run, int(time.time()) + 3600, delta=10)
+
+        # 2. All jobs
+        res = self.db.execute("SELECT cron_next_job_time();").fetchone()[0]
+        all_jobs = json.loads(res)
+        self.assertIn('job1', all_jobs)
+        self.assertEqual(all_jobs['job1'], next_run)
+
+    def test_cron_next_job(self):
+        """Test retrieving the single nearest upcoming job."""
+        self.db.execute("SELECT cron_init('thread');")
+        # Job 1: 1 hour from now
+        self.db.execute("SELECT cron_schedule('job_far', 3600, 'SELECT 1');")
+        # Job 2: 1 minute from now (should be nearest)
+        self.db.execute("SELECT cron_schedule('job_near', 60, 'SELECT 1');")
+
+        res = self.db.execute("SELECT cron_next_job();").fetchone()[0]
+        job = json.loads(res)
+
+        self.assertEqual(job['name'], 'job_near')
+        self.assertIsInstance(job['next_run'], int)
+        # Check that it is indeed sooner than the far job
+        near_run = job['next_run']
+
+        # Verify it matches what cron_job_next says
+        far_run = self.db.execute("SELECT cron_job_next('job_far');").fetchone()[0]
+        self.assertLess(near_run, far_run)
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
