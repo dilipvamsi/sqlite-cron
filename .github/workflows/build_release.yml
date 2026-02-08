@@ -1,0 +1,129 @@
+name: Build and Release
+
+on:
+  release:
+    types: [created]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ==================================================================
+          # LINUX BUILDS
+          # ==================================================================
+
+          # 1. Linux x64
+          - os: ubuntu-latest
+            target: linux-x64
+            asset_name: sqlite_cron-linux-x64.so
+            install_deps: |
+              sudo apt-get update
+              sudo apt-get install -y libsqlite3-dev
+            build_cmd: make linux CFLAGS="-fPIC -O3 -DCRON_USE_LOCAL_TIME -Iheaders -Iexternal"
+
+          # 2. Linux ARM64
+          - os: ubuntu-latest
+            target: linux-arm64
+            asset_name: sqlite_cron-linux-arm64.so
+            install_deps: |
+              sudo apt-get update
+              sudo apt-get install -y gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+            # Override CC to use the cross-compiler
+            build_cmd: make linux CC=aarch64-linux-gnu-gcc CFLAGS="-fPIC -O3 -DCRON_USE_LOCAL_TIME -Iheaders -Iexternal" LDFLAGS_LINUX="-shared -Wl,-z,max-page-size=4096"
+
+          # ==================================================================
+          # WINDOWS BUILDS (Cross-compiled from Linux)
+          # ==================================================================
+
+          # 3. Windows x64 (Standard)
+          - os: ubuntu-latest
+            target: windows-x64
+            asset_name: sqlite_cron-windows-x64.dll
+            install_deps: |
+              sudo apt-get update
+              sudo apt-get install -y mingw-w64
+            # Use windows-cross target which uses x86_64-w64-mingw32-gcc
+            # We override CFLAGS to remove TEST_MODE
+            build_cmd: make windows-cross CFLAGS="-O3 -DCRON_USE_LOCAL_TIME -Iheaders -Iexternal"
+
+          # 4. Windows ARM64 (LLVM-MinGW)
+          - os: ubuntu-latest
+            target: windows-arm64
+            asset_name: sqlite_cron-windows-arm64.dll
+            install_deps: |
+              curl -L -o llvm-mingw.tar.xz https://github.com/mstorsjo/llvm-mingw/releases/download/20231128/llvm-mingw-20231128-ucrt-ubuntu-20.04-x86_64.tar.xz
+              tar -xf llvm-mingw.tar.xz
+              echo "$PWD/llvm-mingw-20231128-ucrt-ubuntu-20.04-x86_64/bin" >> $GITHUB_PATH
+            # Reuse windows-cross target but override CC to llvm-mingw's clang
+            build_cmd: make windows-cross CC_WIN=aarch64-w64-mingw32-gcc CFLAGS="-O3 -DCRON_USE_LOCAL_TIME -Iheaders -Iexternal"
+
+          # ==================================================================
+          # MACOS BUILD (Universal: Intel + Apple Silicon)
+          # ==================================================================
+
+          # 6. macOS Universal
+          - os: macos-latest
+            target: macos-universal
+            asset_name: sqlite_cron-macos-universal.dylib
+            install_deps: |
+              # No extra deps needed for standard build usually, but ensuring headers if needed
+              # sqlite-cron makefile 'macos' target handles download-ccronexpr
+              echo "Ready to build"
+            # Standard macos target
+            build_cmd: make macos CFLAGS="-dynamiclib -O3 -DCRON_USE_LOCAL_TIME -Iheaders -Iexternal"
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Install Dependencies
+        run: ${{ matrix.install_deps }}
+
+      - name: Compile Extension
+        run: ${{ matrix.build_cmd }}
+
+      - name: Strip Debug Symbols
+        run: |
+          cd build
+
+          if [[ "${{ matrix.target }}" == "linux-arm64" ]]; then
+            aarch64-linux-gnu-strip --strip-unneeded sqlite_cron.so
+          elif [[ "${{ matrix.target }}" == "windows-arm64" ]]; then
+            # llvm-mingw
+            aarch64-w64-mingw32-strip --strip-unneeded sqlite_cron.dll
+          elif [[ "${{ matrix.target }}" == "windows-x64" ]]; then
+            x86_64-w64-mingw32-strip --strip-unneeded sqlite_cron.dll
+          elif [[ "${{ matrix.target }}" == "linux-x64" ]]; then
+            strip --strip-unneeded sqlite_cron.so
+          fi
+          # macOS stripping is often handled by linker or unneeded for distribution
+
+      - name: Prepare Artifacts
+        run: |
+          cd build
+          ls -la
+
+          # Rename output file to match the asset name defined in the matrix
+          if [[ "${{ matrix.target }}" == *"windows"* ]]; then
+            mv sqlite_cron.dll ../${{ matrix.asset_name }}
+          elif [[ "${{ matrix.target }}" == *"macos"* ]]; then
+            mv sqlite_cron.dylib ../${{ matrix.asset_name }}
+          else
+            mv sqlite_cron.so ../${{ matrix.asset_name }}
+          fi
+
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v1
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: ${{ matrix.asset_name }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

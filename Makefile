@@ -21,20 +21,15 @@ $(BUILD_DIR):
 linux: $(BUILD_DIR) download-ccronexpr
 	$(CC) $(CFLAGS) $(COVERAGE) src/sqlite_cron.c external/ccronexpr.c -o $(BUILD_DIR)/sqlite_cron.so $(LDFLAGS_LINUX)
 
-
 macos: $(BUILD_DIR) download-ccronexpr
 	$(CC) $(CFLAGS) src/sqlite_cron.c external/ccronexpr.c -o $(BUILD_DIR)/sqlite_cron.dylib $(LDFLAGS_MAC)
-
 
 windows: $(BUILD_DIR) download-ccronexpr
 	$(CC) $(CFLAGS) src/sqlite_cron.c external/ccronexpr.c -o $(BUILD_DIR)/sqlite_cron.dll $(LDFLAGS_WIN)
 
-
 # Cross-compile Windows DLL on Linux
 windows-cross: $(BUILD_DIR) download-headers download-ccronexpr
-	$(CC_WIN) $(CFLAGS) -DTEST_MODE src/sqlite_cron.c external/ccronexpr.c -o $(BUILD_DIR)/sqlite_cron.dll $(LDFLAGS_WIN)
-
-
+	$(CC_WIN) $(CFLAGS) src/sqlite_cron.c external/ccronexpr.c -o $(BUILD_DIR)/sqlite_cron.dll $(LDFLAGS_WIN)
 
 download-headers:
 	@if [ -f headers/sqlite3.h ] && [ -f headers/sqlite3ext.h ]; then \
